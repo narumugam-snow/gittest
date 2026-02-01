@@ -1,0 +1,102 @@
+name: DCM Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'definitions/**'
+      - 'manifest.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'PROD'
+        type: choice
+        options:
+          - DEV
+          - PROD
+
+env:
+  SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_DEPLOY_USER }}
+  SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_DEPLOY_PASSWORD }}
+  SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_DEPLOY_ROLE }}
+  SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'PROD' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Snowflake CLI
+        run: pip install snowflake-cli-labs
+
+      - name: Configure Snowflake connection
+        run: |
+          mkdir -p ~/.snowflake
+          cat > ~/.snowflake/connections.toml << EOF
+          [deploy]
+          account = "$SNOWFLAKE_ACCOUNT"
+          user = "$SNOWFLAKE_USER"
+          password = "$SNOWFLAKE_PASSWORD"
+          role = "$SNOWFLAKE_ROLE"
+          warehouse = "$SNOWFLAKE_WAREHOUSE"
+          EOF
+
+      - name: Set environment
+        id: env
+        run: |
+          ENV="${{ github.event.inputs.environment || 'PROD' }}"
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+
+      - name: Clean and Analyze
+        run: |
+          rm -rf ./out
+          snow dcm analyze TEMP.NARUMUGAM.ANALYTICS_PROJECT \
+            -c deploy \
+            --configuration ${{ steps.env.outputs.environment }} \
+            --output-path ./out/analyze
+
+      - name: Plan
+        run: |
+          snow dcm plan TEMP.NARUMUGAM.ANALYTICS_PROJECT \
+            -c deploy \
+            --configuration ${{ steps.env.outputs.environment }} \
+            --output-path ./out/plan
+
+      - name: Validate Plan
+        run: |
+          STATUS=$(cat ./out/plan/plan_output.json | jq -r '.status')
+          if [ "$STATUS" = "PLAN_FAILED" ]; then
+            echo "::error::Plan failed"
+            exit 1
+          fi
+
+      - name: Deploy
+        run: |
+          ALIAS="github-${{ github.run_number }}-${{ github.sha }}"
+          snow dcm deploy TEMP.NARUMUGAM.ANALYTICS_PROJECT \
+            -c deploy \
+            --configuration ${{ steps.env.outputs.environment }} \
+            --alias "$ALIAS"
+
+      - name: Refresh Dynamic Tables
+        run: |
+          snow dcm refresh TEMP.NARUMUGAM.ANALYTICS_PROJECT -c deploy
+
+      - name: Run Tests
+        run: |
+          snow dcm test TEMP.NARUMUGAM.ANALYTICS_PROJECT \
+            -c deploy \
+            --output-path ./out/test || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-artifacts
+          path: ./out/

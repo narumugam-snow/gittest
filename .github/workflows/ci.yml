@@ -1,0 +1,103 @@
+name: DCM Validate
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'definitions/**'
+      - 'manifest.yml'
+
+env:
+  SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+  SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+  SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+  SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Snowflake CLI
+        run: pip install snowflake-cli-labs
+
+      - name: Configure Snowflake connection
+        run: |
+          mkdir -p ~/.snowflake
+          cat > ~/.snowflake/connections.toml << EOF
+          [ci]
+          account = "$SNOWFLAKE_ACCOUNT"
+          user = "$SNOWFLAKE_USER"
+          password = "$SNOWFLAKE_PASSWORD"
+          role = "$SNOWFLAKE_ROLE"
+          warehouse = "$SNOWFLAKE_WAREHOUSE"
+          EOF
+
+      - name: Clean output directory
+        run: rm -rf ./out
+
+      - name: DCM Analyze
+        run: |
+          snow dcm analyze TEMP.NARUMUGAM.ANALYTICS_PROJECT \
+            -c ci \
+            --configuration DEV \
+            --output-path ./out/analyze
+
+      - name: Check analyze results
+        run: |
+          if [ -f ./out/analyze/analyze_output.json ]; then
+            echo "=== Analyze Output ==="
+            cat ./out/analyze/analyze_output.json | jq '.'
+            
+            ERRORS=$(cat ./out/analyze/analyze_output.json | jq '[.. | objects | select(has("errors")) | .errors[]] | length')
+            if [ "$ERRORS" -gt 0 ]; then
+              echo "::error::Found $ERRORS errors in analysis"
+              exit 1
+            fi
+          fi
+
+      - name: DCM Plan
+        run: |
+          rm -rf ./out/plan
+          snow dcm plan TEMP.NARUMUGAM.ANALYTICS_PROJECT \
+            -c ci \
+            --configuration DEV \
+            --output-path ./out/plan
+
+      - name: Generate Plan Summary
+        id: plan
+        run: |
+          if [ -f ./out/plan/plan_output.json ]; then
+            STATUS=$(cat ./out/plan/plan_output.json | jq -r '.status')
+            if [ "$STATUS" = "PLAN_FAILED" ]; then
+              ERROR=$(cat ./out/plan/plan_output.json | jq -r '.error')
+              echo "::error::Plan failed: $ERROR"
+              exit 1
+            fi
+            
+            CREATES=$(cat ./out/plan/plan_output.json | jq '[.ddlChangeLog.operations[]? | select(.operationType == "CREATE")] | length')
+            ALTERS=$(cat ./out/plan/plan_output.json | jq '[.ddlChangeLog.operations[]? | select(.operationType == "ALTER")] | length')
+            DROPS=$(cat ./out/plan/plan_output.json | jq '[.ddlChangeLog.operations[]? | select(.operationType == "DROP")] | length')
+            
+            echo "## DCM Plan Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Operation | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| CREATE | $CREATES |" >> $GITHUB_STEP_SUMMARY
+            echo "| ALTER | $ALTERS |" >> $GITHUB_STEP_SUMMARY
+            echo "| DROP | $DROPS |" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$DROPS" -gt 0 ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "::warning::This PR includes $DROPS DROP operations. Please review carefully."
+            fi
+          fi
+
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dcm-plan
+          path: ./out/
