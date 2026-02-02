@@ -1,0 +1,814 @@
+# Demo 04: Serverless Feature Migration
+
+## Overview
+This demo covers migrating to Snowflake's serverless features for cost optimization:
+- Snowpipe for continuous data loading
+- Dynamic Tables for automated transformations
+- Serverless Tasks
+- Streams for CDC (Change Data Capture)
+
+## Prerequisites
+- Completed Demos 01-03
+- ACCOUNTADMIN or role with CREATE PIPE privileges
+- Access to cloud storage (S3/Azure/GCS) for Snowpipe demo
+- Sample tables for Dynamic Tables demo
+
+## Demo Duration: 60-90 minutes
+
+---
+
+## Part 1: Snowpipe vs COPY INTO Analysis
+
+### Step 1.1: Analyze Current COPY INTO Patterns
+
+```sql
+-- Identify COPY INTO workloads that could benefit from Snowpipe
+CREATE OR REPLACE VIEW ADMIN_DB.MONITORING.SNOWPIPE_CANDIDATES AS
+SELECT 
+    DATE_TRUNC('hour', START_TIME) as LOAD_HOUR,
+    WAREHOUSE_NAME,
+    DATABASE_NAME,
+    -- Try to identify target table
+    REGEXP_SUBSTR(QUERY_TEXT, 'INTO\\s+([A-Z0-9_\\.]+)', 1, 1, 'ie', 1) as TARGET_TABLE,
+    COUNT(*) as COPY_COUNT,
+    SUM(ROWS_PRODUCED) as TOTAL_ROWS,
+    AVG(ROWS_PRODUCED) as AVG_ROWS_PER_COPY,
+    SUM(TOTAL_ELAPSED_TIME) / 1000 as TOTAL_DURATION_SEC,
+    AVG(TOTAL_ELAPSED_TIME) / 1000 as AVG_DURATION_SEC,
+    SUM(CREDITS_USED_CLOUD_SERVICES) as CLOUD_CREDITS
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE QUERY_TYPE = 'COPY'
+  AND START_TIME >= DATEADD(day, -7, CURRENT_TIMESTAMP())
+  AND EXECUTION_STATUS = 'SUCCESS'
+GROUP BY 1, 2, 3, 4;
+
+-- View hourly COPY patterns
+SELECT 
+    LOAD_HOUR,
+    WAREHOUSE_NAME,
+    COPY_COUNT,
+    TOTAL_ROWS,
+    AVG_ROWS_PER_COPY,
+    CASE 
+        WHEN COPY_COUNT >= 20 AND AVG_ROWS_PER_COPY < 500000 
+        THEN '🟢 HIGH PRIORITY - Migrate to Snowpipe'
+        WHEN COPY_COUNT >= 10 
+        THEN '🟡 MEDIUM PRIORITY - Consider Snowpipe'
+        WHEN AVG_ROWS_PER_COPY < 100000 
+        THEN '🟠 EVALUATE - Small loads may benefit'
+        ELSE '⚪ KEEP COPY INTO - Large batch loads'
+    END as RECOMMENDATION
+FROM ADMIN_DB.MONITORING.SNOWPIPE_CANDIDATES
+ORDER BY LOAD_HOUR DESC, COPY_COUNT DESC
+LIMIT 50;
+
+-- Summary by warehouse
+SELECT 
+    WAREHOUSE_NAME,
+    COUNT(DISTINCT LOAD_HOUR) as ACTIVE_HOURS,
+    SUM(COPY_COUNT) as TOTAL_COPIES_7DAYS,
+    ROUND(AVG(COPY_COUNT), 1) as AVG_COPIES_PER_HOUR,
+    ROUND(AVG(AVG_ROWS_PER_COPY), 0) as AVG_ROWS_PER_COPY,
+    CASE 
+        WHEN AVG(COPY_COUNT) >= 10 AND AVG(AVG_ROWS_PER_COPY) < 500000 
+        THEN '🟢 SNOWPIPE RECOMMENDED'
+        WHEN AVG(COPY_COUNT) >= 5 
+        THEN '🟡 EVALUATE SNOWPIPE'
+        ELSE '⚪ KEEP COPY INTO'
+    END as RECOMMENDATION
+FROM ADMIN_DB.MONITORING.SNOWPIPE_CANDIDATES
+GROUP BY WAREHOUSE_NAME
+ORDER BY TOTAL_COPIES_7DAYS DESC;
+```
+
+### Step 1.2: Cost Comparison Calculator
+
+```sql
+-- Estimate cost savings from Snowpipe migration
+WITH copy_costs AS (
+    SELECT 
+        WAREHOUSE_NAME,
+        COUNT(*) as TOTAL_COPIES,
+        SUM(TOTAL_ELAPSED_TIME) / 1000 / 3600 as TOTAL_WAREHOUSE_HOURS,
+        -- Estimate credits based on warehouse size (simplified)
+        SUM(TOTAL_ELAPSED_TIME) / 1000 / 3600 * 
+            CASE 
+                WHEN WAREHOUSE_SIZE = 'X-Small' THEN 1
+                WHEN WAREHOUSE_SIZE = 'Small' THEN 2
+                WHEN WAREHOUSE_SIZE = 'Medium' THEN 4
+                WHEN WAREHOUSE_SIZE = 'Large' THEN 8
+                ELSE 2  -- Default assumption
+            END as ESTIMATED_CREDITS,
+        SUM(ROWS_PRODUCED) as TOTAL_ROWS
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+    WHERE QUERY_TYPE = 'COPY'
+      AND START_TIME >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+      AND EXECUTION_STATUS = 'SUCCESS'
+    GROUP BY WAREHOUSE_NAME, WAREHOUSE_SIZE
+),
+snowpipe_estimate AS (
+    SELECT 
+        WAREHOUSE_NAME,
+        TOTAL_COPIES,
+        TOTAL_ROWS,
+        -- Snowpipe costs approximately 0.06 credits per 1000 files
+        -- Plus serverless compute (roughly 1.25x standard credit rate)
+        ROUND(TOTAL_COPIES * 0.06 / 1000, 2) as PIPE_NOTIFICATION_CREDITS,
+        -- Estimate serverless compute (usually much less than warehouse)
+        ROUND(TOTAL_WAREHOUSE_HOURS * 0.3 * 1.25, 2) as SERVERLESS_COMPUTE_CREDITS
+    FROM copy_costs
+)
+SELECT 
+    cc.WAREHOUSE_NAME,
+    cc.TOTAL_COPIES,
+    cc.TOTAL_ROWS,
+    
+    -- Current COPY INTO costs
+    ROUND(cc.ESTIMATED_CREDITS, 2) as COPY_INTO_CREDITS,
+    ROUND(cc.ESTIMATED_CREDITS * 3.00, 2) as COPY_INTO_COST_USD,
+    
+    -- Estimated Snowpipe costs
+    ROUND(se.PIPE_NOTIFICATION_CREDITS + se.SERVERLESS_COMPUTE_CREDITS, 2) as SNOWPIPE_CREDITS,
+    ROUND((se.PIPE_NOTIFICATION_CREDITS + se.SERVERLESS_COMPUTE_CREDITS) * 3.00, 2) as SNOWPIPE_COST_USD,
+    
+    -- Savings
+    ROUND(cc.ESTIMATED_CREDITS - (se.PIPE_NOTIFICATION_CREDITS + se.SERVERLESS_COMPUTE_CREDITS), 2) as CREDIT_SAVINGS,
+    ROUND((cc.ESTIMATED_CREDITS - (se.PIPE_NOTIFICATION_CREDITS + se.SERVERLESS_COMPUTE_CREDITS)) * 3.00, 2) as USD_SAVINGS,
+    ROUND((cc.ESTIMATED_CREDITS - (se.PIPE_NOTIFICATION_CREDITS + se.SERVERLESS_COMPUTE_CREDITS)) / NULLIF(cc.ESTIMATED_CREDITS, 0) * 100, 1) as SAVINGS_PCT
+    
+FROM copy_costs cc
+JOIN snowpipe_estimate se ON cc.WAREHOUSE_NAME = se.WAREHOUSE_NAME
+WHERE cc.ESTIMATED_CREDITS > 10
+ORDER BY CREDIT_SAVINGS DESC;
+```
+
+### Step 1.3: Create Snowpipe (End-to-End Demo)
+
+```sql
+-- DEMO: Complete Snowpipe setup
+
+-- Step 1: Create target database and schema
+CREATE DATABASE IF NOT EXISTS DEMO_INGEST_DB;
+CREATE SCHEMA IF NOT EXISTS DEMO_INGEST_DB.RAW;
+
+-- Step 2: Create file format
+CREATE OR REPLACE FILE FORMAT DEMO_INGEST_DB.RAW.CSV_FORMAT
+    TYPE = 'CSV'
+    FIELD_DELIMITER = ','
+    SKIP_HEADER = 1
+    NULL_IF = ('NULL', 'null', '')
+    EMPTY_FIELD_AS_NULL = TRUE
+    FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+    COMPRESSION = AUTO;
+
+CREATE OR REPLACE FILE FORMAT DEMO_INGEST_DB.RAW.JSON_FORMAT
+    TYPE = 'JSON'
+    COMPRESSION = AUTO
+    STRIP_OUTER_ARRAY = TRUE;
+
+-- Step 3: Create external stage (example for S3)
+-- Replace with your actual cloud storage details
+/*
+CREATE OR REPLACE STAGE DEMO_INGEST_DB.RAW.S3_LANDING_STAGE
+    URL = 's3://your-bucket/landing/'
+    STORAGE_INTEGRATION = your_s3_integration
+    FILE_FORMAT = DEMO_INGEST_DB.RAW.CSV_FORMAT;
+*/
+
+-- For demo purposes, create internal stage
+CREATE OR REPLACE STAGE DEMO_INGEST_DB.RAW.INTERNAL_STAGE
+    FILE_FORMAT = DEMO_INGEST_DB.RAW.CSV_FORMAT;
+
+-- Step 4: Create target table
+CREATE OR REPLACE TABLE DEMO_INGEST_DB.RAW.CUSTOMER_EVENTS (
+    EVENT_ID VARCHAR(50),
+    CUSTOMER_ID VARCHAR(50),
+    EVENT_TYPE VARCHAR(100),
+    EVENT_TIMESTAMP TIMESTAMP,
+    EVENT_DATA VARIANT,
+    FILE_NAME VARCHAR(500),
+    LOAD_TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Step 5: Create the pipe
+CREATE OR REPLACE PIPE DEMO_INGEST_DB.RAW.CUSTOMER_EVENTS_PIPE
+    AUTO_INGEST = TRUE
+    COMMENT = 'Demo pipe for customer events'
+AS
+COPY INTO DEMO_INGEST_DB.RAW.CUSTOMER_EVENTS (
+    EVENT_ID,
+    CUSTOMER_ID,
+    EVENT_TYPE,
+    EVENT_TIMESTAMP,
+    EVENT_DATA,
+    FILE_NAME
+)
+FROM (
+    SELECT 
+        $1::VARCHAR as EVENT_ID,
+        $2::VARCHAR as CUSTOMER_ID,
+        $3::VARCHAR as EVENT_TYPE,
+        TRY_TO_TIMESTAMP($4) as EVENT_TIMESTAMP,
+        TRY_PARSE_JSON($5) as EVENT_DATA,
+        METADATA$FILENAME as FILE_NAME
+    FROM @DEMO_INGEST_DB.RAW.INTERNAL_STAGE
+);
+
+-- Step 6: Get the notification channel (for cloud event setup)
+SHOW PIPES LIKE 'CUSTOMER_EVENTS_PIPE' IN SCHEMA DEMO_INGEST_DB.RAW;
+-- The notification_channel column contains the SQS/Event Grid/Pub-Sub endpoint
+
+-- Step 7: Check pipe status
+SELECT SYSTEM$PIPE_STATUS('DEMO_INGEST_DB.RAW.CUSTOMER_EVENTS_PIPE');
+```
+
+### Step 1.4: Test and Monitor Snowpipe
+
+```sql
+-- Upload test file (manual trigger for demo)
+-- In production, files would be automatically detected via cloud events
+
+-- Check pipe status
+SELECT SYSTEM$PIPE_STATUS('DEMO_INGEST_DB.RAW.CUSTOMER_EVENTS_PIPE');
+
+-- Manually refresh pipe to process existing files (for testing)
+ALTER PIPE DEMO_INGEST_DB.RAW.CUSTOMER_EVENTS_PIPE REFRESH;
+
+-- View copy history for the pipe
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
+    TABLE_NAME => 'DEMO_INGEST_DB.RAW.CUSTOMER_EVENTS',
+    START_TIME => DATEADD(hour, -24, CURRENT_TIMESTAMP())
+))
+ORDER BY LAST_LOAD_TIME DESC;
+
+-- Monitor Snowpipe usage and costs
+SELECT 
+    DATE_TRUNC('day', START_TIME) as USAGE_DATE,
+    PIPE_NAME,
+    SUM(CREDITS_USED) as PIPE_CREDITS,
+    SUM(FILES_INSERTED) as FILES_LOADED,
+    SUM(BYTES_INSERTED) / POWER(1024, 3) as GB_LOADED,
+    ROUND(SUM(CREDITS_USED) / NULLIF(SUM(BYTES_INSERTED) / POWER(1024, 3), 0), 4) as CREDITS_PER_GB
+FROM SNOWFLAKE.ACCOUNT_USAGE.PIPE_USAGE_HISTORY
+WHERE START_TIME >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+GROUP BY 1, 2
+ORDER BY 1 DESC, PIPE_CREDITS DESC;
+```
+
+---
+
+## Part 2: Dynamic Tables
+
+### Step 2.1: Identify Dynamic Table Candidates
+
+```sql
+-- Find scheduled tasks/queries that refresh tables
+-- These are candidates for Dynamic Tables
+
+-- Current scheduled tasks
+SELECT 
+    NAME as TASK_NAME,
+    DATABASE_NAME,
+    SCHEMA_NAME,
+    WAREHOUSE,
+    SCHEDULE,
+    STATE,
+    LEFT(DEFINITION, 200) as DEFINITION_PREVIEW
+FROM SNOWFLAKE.ACCOUNT_USAGE.TASKS
+WHERE STATE = 'started'
+  AND (DEFINITION ILIKE '%INSERT%' 
+       OR DEFINITION ILIKE '%MERGE%' 
+       OR DEFINITION ILIKE '%CREATE%TABLE%AS%')
+ORDER BY DATABASE_NAME, SCHEMA_NAME;
+
+-- Repeatedly executed transformation queries
+SELECT 
+    QUERY_PARAMETERIZED_HASH,
+    ANY_VALUE(LEFT(QUERY_TEXT, 300)) as QUERY_SAMPLE,
+    ANY_VALUE(DATABASE_NAME) as DATABASE_NAME,
+    ANY_VALUE(USER_NAME) as USER_NAME,
+    COUNT(*) as EXECUTION_COUNT,
+    SUM(TOTAL_ELAPSED_TIME) / 1000 / 60 as TOTAL_MINUTES,
+    AVG(TOTAL_ELAPSED_TIME) / 1000 as AVG_DURATION_SEC
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE START_TIME >= DATEADD(day, -7, CURRENT_TIMESTAMP())
+  AND QUERY_TYPE IN ('CREATE_TABLE_AS_SELECT', 'INSERT', 'MERGE')
+  AND EXECUTION_STATUS = 'SUCCESS'
+GROUP BY QUERY_PARAMETERIZED_HASH
+HAVING COUNT(*) >= 5
+ORDER BY TOTAL_MINUTES DESC
+LIMIT 20;
+```
+
+### Step 2.2: Create Dynamic Tables (Complete Demo)
+
+```sql
+-- DEMO: Create a Dynamic Table pipeline (Bronze -> Silver -> Gold)
+
+-- Setup: Create sample source tables
+CREATE OR REPLACE TABLE DEMO_INGEST_DB.RAW.ORDERS_RAW (
+    ORDER_ID VARCHAR(50),
+    CUSTOMER_ID VARCHAR(50),
+    ORDER_DATE VARCHAR(50),
+    ORDER_AMOUNT VARCHAR(50),
+    STATUS VARCHAR(50),
+    LOAD_TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE TABLE DEMO_INGEST_DB.RAW.CUSTOMERS_RAW (
+    CUSTOMER_ID VARCHAR(50),
+    CUSTOMER_NAME VARCHAR(200),
+    REGION VARCHAR(50),
+    SEGMENT VARCHAR(50),
+    LOAD_TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Insert sample data
+INSERT INTO DEMO_INGEST_DB.RAW.ORDERS_RAW (ORDER_ID, CUSTOMER_ID, ORDER_DATE, ORDER_AMOUNT, STATUS)
+VALUES 
+    ('ORD001', 'C001', '2025-01-15', '150.00', 'COMPLETED'),
+    ('ORD002', 'C002', '2025-01-16', '250.00', 'PENDING'),
+    ('ORD003', 'C001', '2025-01-17', '75.50', 'COMPLETED'),
+    ('ORD004', 'C003', '2025-01-18', '500.00', 'SHIPPED');
+
+INSERT INTO DEMO_INGEST_DB.RAW.CUSTOMERS_RAW (CUSTOMER_ID, CUSTOMER_NAME, REGION, SEGMENT)
+VALUES 
+    ('C001', 'Acme Corp', 'WEST', 'ENTERPRISE'),
+    ('C002', 'Beta Inc', 'EAST', 'SMB'),
+    ('C003', 'Gamma LLC', 'CENTRAL', 'ENTERPRISE');
+
+-- Create schema for transformed data
+CREATE SCHEMA IF NOT EXISTS DEMO_INGEST_DB.BRONZE;
+CREATE SCHEMA IF NOT EXISTS DEMO_INGEST_DB.SILVER;
+CREATE SCHEMA IF NOT EXISTS DEMO_INGEST_DB.GOLD;
+
+-- BRONZE LAYER: Cleaned raw data
+-- Target lag of 1 minute - very fresh data
+CREATE OR REPLACE DYNAMIC TABLE DEMO_INGEST_DB.BRONZE.ORDERS_CLEANED
+    TARGET_LAG = '1 minute'
+    WAREHOUSE = COMPUTE_WH  -- Replace with your warehouse
+AS
+SELECT 
+    ORDER_ID,
+    CUSTOMER_ID,
+    TRY_TO_DATE(ORDER_DATE) as ORDER_DATE,
+    TRY_TO_DECIMAL(ORDER_AMOUNT, 18, 2) as ORDER_AMOUNT,
+    UPPER(TRIM(STATUS)) as STATUS,
+    LOAD_TIMESTAMP,
+    CURRENT_TIMESTAMP() as PROCESSED_TIMESTAMP
+FROM DEMO_INGEST_DB.RAW.ORDERS_RAW
+WHERE ORDER_ID IS NOT NULL;
+
+CREATE OR REPLACE DYNAMIC TABLE DEMO_INGEST_DB.BRONZE.CUSTOMERS_CLEANED
+    TARGET_LAG = '1 minute'
+    WAREHOUSE = COMPUTE_WH
+AS
+SELECT 
+    CUSTOMER_ID,
+    TRIM(CUSTOMER_NAME) as CUSTOMER_NAME,
+    UPPER(TRIM(REGION)) as REGION,
+    UPPER(TRIM(SEGMENT)) as SEGMENT,
+    LOAD_TIMESTAMP,
+    CURRENT_TIMESTAMP() as PROCESSED_TIMESTAMP
+FROM DEMO_INGEST_DB.RAW.CUSTOMERS_RAW
+WHERE CUSTOMER_ID IS NOT NULL;
+
+-- SILVER LAYER: Business logic applied (joins, enrichment)
+-- Target lag of 5 minutes - near real-time
+CREATE OR REPLACE DYNAMIC TABLE DEMO_INGEST_DB.SILVER.ORDERS_ENRICHED
+    TARGET_LAG = '5 minutes'
+    WAREHOUSE = COMPUTE_WH
+AS
+SELECT 
+    o.ORDER_ID,
+    o.CUSTOMER_ID,
+    c.CUSTOMER_NAME,
+    c.REGION,
+    c.SEGMENT,
+    o.ORDER_DATE,
+    o.ORDER_AMOUNT,
+    o.STATUS,
+    o.PROCESSED_TIMESTAMP as ORDER_PROCESSED_AT,
+    CURRENT_TIMESTAMP() as ENRICHED_AT
+FROM DEMO_INGEST_DB.BRONZE.ORDERS_CLEANED o
+LEFT JOIN DEMO_INGEST_DB.BRONZE.CUSTOMERS_CLEANED c 
+    ON o.CUSTOMER_ID = c.CUSTOMER_ID;
+
+-- GOLD LAYER: Aggregated for reporting
+-- Target lag of 1 hour - for dashboards
+CREATE OR REPLACE DYNAMIC TABLE DEMO_INGEST_DB.GOLD.DAILY_SALES_SUMMARY
+    TARGET_LAG = '1 hour'
+    WAREHOUSE = COMPUTE_WH
+AS
+SELECT 
+    ORDER_DATE,
+    REGION,
+    SEGMENT,
+    COUNT(DISTINCT ORDER_ID) as ORDER_COUNT,
+    COUNT(DISTINCT CUSTOMER_ID) as CUSTOMER_COUNT,
+    SUM(ORDER_AMOUNT) as TOTAL_REVENUE,
+    AVG(ORDER_AMOUNT) as AVG_ORDER_VALUE,
+    COUNT(CASE WHEN STATUS = 'COMPLETED' THEN 1 END) as COMPLETED_ORDERS,
+    COUNT(CASE WHEN STATUS = 'PENDING' THEN 1 END) as PENDING_ORDERS,
+    CURRENT_TIMESTAMP() as REFRESHED_AT
+FROM DEMO_INGEST_DB.SILVER.ORDERS_ENRICHED
+GROUP BY ORDER_DATE, REGION, SEGMENT;
+
+-- Verify Dynamic Tables were created
+SHOW DYNAMIC TABLES IN DATABASE DEMO_INGEST_DB;
+```
+
+### Step 2.3: Monitor Dynamic Tables
+
+```sql
+-- Check Dynamic Table status
+SELECT 
+    NAME,
+    SCHEMA_NAME,
+    TARGET_LAG,
+    REFRESH_MODE,
+    SCHEDULING_STATE,
+    LAST_REFRESH_TIME,
+    NEXT_SCHEDULED_REFRESH_TIME,
+    DATA_TIMESTAMP
+FROM TABLE(INFORMATION_SCHEMA.DYNAMIC_TABLES())
+WHERE DATABASE_NAME = 'DEMO_INGEST_DB';
+
+-- View refresh history
+SELECT 
+    NAME,
+    SCHEMA_NAME,
+    REFRESH_START_TIME,
+    REFRESH_END_TIME,
+    REFRESH_ACTION,
+    REFRESH_TRIGGER,
+    STATISTICS:numInsertedRows::INT as ROWS_INSERTED,
+    STATISTICS:numDeletedRows::INT as ROWS_DELETED,
+    STATISTICS:numUpdatedRows::INT as ROWS_UPDATED
+FROM TABLE(INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY())
+WHERE DATABASE_NAME = 'DEMO_INGEST_DB'
+ORDER BY REFRESH_START_TIME DESC
+LIMIT 20;
+
+-- Monitor Dynamic Table costs
+SELECT 
+    DATE_TRUNC('day', REFRESH_START_TIME) as USAGE_DATE,
+    NAME as DT_NAME,
+    DATABASE_NAME,
+    COUNT(*) as REFRESH_COUNT,
+    SUM(CREDITS_USED) as TOTAL_CREDITS,
+    AVG(TIMESTAMPDIFF('second', REFRESH_START_TIME, REFRESH_END_TIME)) as AVG_REFRESH_SEC,
+    SUM(CASE WHEN REFRESH_ACTION = 'INCREMENTAL' THEN 1 ELSE 0 END) as INCREMENTAL_REFRESHES,
+    SUM(CASE WHEN REFRESH_ACTION = 'FULL' THEN 1 ELSE 0 END) as FULL_REFRESHES
+FROM SNOWFLAKE.ACCOUNT_USAGE.DYNAMIC_TABLE_REFRESH_HISTORY
+WHERE REFRESH_START_TIME >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+GROUP BY 1, 2, 3
+ORDER BY 1 DESC, TOTAL_CREDITS DESC;
+```
+
+### Step 2.4: Configure Dynamic Table Settings
+
+```sql
+-- Adjust target lag based on business needs
+-- Shorter lag = more frequent refreshes = higher cost
+
+-- Make gold layer refresh less frequently
+ALTER DYNAMIC TABLE DEMO_INGEST_DB.GOLD.DAILY_SALES_SUMMARY
+    SET TARGET_LAG = '4 hours';
+
+-- Use DOWNSTREAM lag (refresh only when downstream DT needs data)
+ALTER DYNAMIC TABLE DEMO_INGEST_DB.SILVER.ORDERS_ENRICHED
+    SET TARGET_LAG = DOWNSTREAM;
+
+-- Suspend Dynamic Table (stop refreshes, save costs)
+ALTER DYNAMIC TABLE DEMO_INGEST_DB.GOLD.DAILY_SALES_SUMMARY SUSPEND;
+
+-- Resume Dynamic Table
+ALTER DYNAMIC TABLE DEMO_INGEST_DB.GOLD.DAILY_SALES_SUMMARY RESUME;
+
+-- Manually trigger refresh (for testing)
+ALTER DYNAMIC TABLE DEMO_INGEST_DB.BRONZE.ORDERS_CLEANED REFRESH;
+```
+
+### Step 2.5: Test Dynamic Table Pipeline
+
+```sql
+-- Insert new data into source
+INSERT INTO DEMO_INGEST_DB.RAW.ORDERS_RAW (ORDER_ID, CUSTOMER_ID, ORDER_DATE, ORDER_AMOUNT, STATUS)
+VALUES ('ORD005', 'C002', '2025-01-20', '320.00', 'PENDING');
+
+-- Wait for propagation (based on target lag) or force refresh
+ALTER DYNAMIC TABLE DEMO_INGEST_DB.BRONZE.ORDERS_CLEANED REFRESH;
+
+-- Check data in each layer
+SELECT COUNT(*) as ROW_COUNT, MAX(PROCESSED_TIMESTAMP) as LATEST FROM DEMO_INGEST_DB.BRONZE.ORDERS_CLEANED;
+SELECT COUNT(*) as ROW_COUNT, MAX(ENRICHED_AT) as LATEST FROM DEMO_INGEST_DB.SILVER.ORDERS_ENRICHED;
+SELECT * FROM DEMO_INGEST_DB.GOLD.DAILY_SALES_SUMMARY;
+```
+
+---
+
+## Part 3: Serverless Tasks
+
+### Step 3.1: Compare Traditional vs Serverless Tasks
+
+```sql
+-- Current task costs (warehouse-based)
+SELECT 
+    DATE_TRUNC('day', SCHEDULED_TIME) as USAGE_DATE,
+    NAME as TASK_NAME,
+    DATABASE_NAME,
+    COUNT(*) as RUN_COUNT,
+    SUM(SCHEDULED_TIME_DIFF) / 1000 / 60 as TOTAL_RUNTIME_MIN,
+    SUM(CREDITS_USED) as TOTAL_CREDITS
+FROM SNOWFLAKE.ACCOUNT_USAGE.TASK_HISTORY
+WHERE SCHEDULED_TIME >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+  AND STATE = 'SUCCEEDED'
+GROUP BY 1, 2, 3
+ORDER BY TOTAL_CREDITS DESC
+LIMIT 20;
+
+-- Identify tasks that could be serverless
+SELECT 
+    NAME,
+    DATABASE_NAME,
+    WAREHOUSE,
+    SCHEDULE,
+    AVG(SCHEDULED_TIME_DIFF) / 1000 as AVG_RUNTIME_SEC,
+    CASE 
+        WHEN AVG(SCHEDULED_TIME_DIFF) / 1000 < 60 THEN '🟢 Good candidate for serverless'
+        WHEN AVG(SCHEDULED_TIME_DIFF) / 1000 < 300 THEN '🟡 May benefit from serverless'
+        ELSE '⚪ Keep warehouse-based'
+    END as SERVERLESS_RECOMMENDATION
+FROM SNOWFLAKE.ACCOUNT_USAGE.TASK_HISTORY
+WHERE SCHEDULED_TIME >= DATEADD(day, -7, CURRENT_TIMESTAMP())
+  AND STATE = 'SUCCEEDED'
+GROUP BY NAME, DATABASE_NAME, WAREHOUSE, SCHEDULE
+ORDER BY AVG_RUNTIME_SEC;
+```
+
+### Step 3.2: Create Serverless Task
+
+```sql
+-- DEMO: Create a serverless task
+
+-- Serverless task - no warehouse specified
+CREATE OR REPLACE TASK DEMO_INGEST_DB.RAW.CLEANUP_OLD_DATA_SERVERLESS
+    SCHEDULE = 'USING CRON 0 2 * * * America/New_York'  -- 2 AM daily
+    USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'  -- Serverless indicator
+    COMMENT = 'Serverless task to clean up old staging data'
+AS
+    DELETE FROM DEMO_INGEST_DB.RAW.ORDERS_RAW
+    WHERE LOAD_TIMESTAMP < DATEADD(day, -7, CURRENT_TIMESTAMP());
+
+-- Start the task
+ALTER TASK DEMO_INGEST_DB.RAW.CLEANUP_OLD_DATA_SERVERLESS RESUME;
+
+-- View task definition
+SHOW TASKS LIKE 'CLEANUP%' IN SCHEMA DEMO_INGEST_DB.RAW;
+
+-- Compare: Traditional warehouse task
+CREATE OR REPLACE TASK DEMO_INGEST_DB.RAW.CLEANUP_OLD_DATA_WAREHOUSE
+    WAREHOUSE = COMPUTE_WH
+    SCHEDULE = 'USING CRON 0 3 * * * America/New_York'  -- 3 AM daily
+    COMMENT = 'Warehouse-based task to clean up old staging data'
+AS
+    DELETE FROM DEMO_INGEST_DB.RAW.ORDERS_RAW
+    WHERE LOAD_TIMESTAMP < DATEADD(day, -7, CURRENT_TIMESTAMP());
+```
+
+### Step 3.3: Monitor Serverless Task Costs
+
+```sql
+-- Serverless task usage
+SELECT 
+    DATE_TRUNC('day', START_TIME) as USAGE_DATE,
+    TASK_NAME,
+    DATABASE_NAME,
+    COUNT(*) as RUN_COUNT,
+    SUM(CREDITS_USED) as SERVERLESS_CREDITS,
+    ROUND(SUM(CREDITS_USED) * 3.00, 2) as COST_USD
+FROM SNOWFLAKE.ACCOUNT_USAGE.SERVERLESS_TASK_HISTORY
+WHERE START_TIME >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+GROUP BY 1, 2, 3
+ORDER BY 1 DESC, SERVERLESS_CREDITS DESC;
+```
+
+---
+
+## Part 4: Streams for Change Data Capture
+
+### Step 4.1: Create Stream on Source Table
+
+```sql
+-- Create stream to capture changes
+CREATE OR REPLACE STREAM DEMO_INGEST_DB.RAW.ORDERS_STREAM
+    ON TABLE DEMO_INGEST_DB.RAW.ORDERS_RAW
+    SHOW_INITIAL_ROWS = FALSE  -- Only capture changes after stream creation
+    APPEND_ONLY = FALSE;       -- Capture INSERT, UPDATE, DELETE
+
+-- Check stream status
+SHOW STREAMS IN SCHEMA DEMO_INGEST_DB.RAW;
+
+-- View current stream data (changes since last consumption)
+SELECT * FROM DEMO_INGEST_DB.RAW.ORDERS_STREAM;
+```
+
+### Step 4.2: Use Stream with Task for Incremental Processing
+
+```sql
+-- Create target table for incremental loads
+CREATE OR REPLACE TABLE DEMO_INGEST_DB.SILVER.ORDERS_INCREMENTAL (
+    ORDER_ID VARCHAR(50),
+    CUSTOMER_ID VARCHAR(50),
+    ORDER_DATE DATE,
+    ORDER_AMOUNT DECIMAL(18,2),
+    STATUS VARCHAR(50),
+    CHANGE_TYPE VARCHAR(20),
+    PROCESSED_TIMESTAMP TIMESTAMP
+);
+
+-- Create task that processes stream data
+CREATE OR REPLACE TASK DEMO_INGEST_DB.RAW.PROCESS_ORDERS_STREAM
+    WAREHOUSE = COMPUTE_WH
+    SCHEDULE = '1 MINUTE'
+    WHEN SYSTEM$STREAM_HAS_DATA('DEMO_INGEST_DB.RAW.ORDERS_STREAM')
+AS
+    INSERT INTO DEMO_INGEST_DB.SILVER.ORDERS_INCREMENTAL
+    SELECT 
+        ORDER_ID,
+        CUSTOMER_ID,
+        TRY_TO_DATE(ORDER_DATE),
+        TRY_TO_DECIMAL(ORDER_AMOUNT, 18, 2),
+        STATUS,
+        CASE 
+            WHEN METADATA$ACTION = 'INSERT' THEN 'INSERT'
+            WHEN METADATA$ACTION = 'DELETE' AND METADATA$ISUPDATE = TRUE THEN 'UPDATE'
+            WHEN METADATA$ACTION = 'DELETE' THEN 'DELETE'
+        END as CHANGE_TYPE,
+        CURRENT_TIMESTAMP()
+    FROM DEMO_INGEST_DB.RAW.ORDERS_STREAM;
+
+-- Start the task
+ALTER TASK DEMO_INGEST_DB.RAW.PROCESS_ORDERS_STREAM RESUME;
+```
+
+### Step 4.3: Test Stream Processing
+
+```sql
+-- Insert new records
+INSERT INTO DEMO_INGEST_DB.RAW.ORDERS_RAW (ORDER_ID, CUSTOMER_ID, ORDER_DATE, ORDER_AMOUNT, STATUS)
+VALUES ('ORD006', 'C001', '2025-01-21', '175.00', 'PENDING');
+
+-- View stream (before processing)
+SELECT * FROM DEMO_INGEST_DB.RAW.ORDERS_STREAM;
+
+-- After task runs, check incremental table
+SELECT * FROM DEMO_INGEST_DB.SILVER.ORDERS_INCREMENTAL ORDER BY PROCESSED_TIMESTAMP DESC;
+
+-- Update a record
+UPDATE DEMO_INGEST_DB.RAW.ORDERS_RAW SET STATUS = 'COMPLETED' WHERE ORDER_ID = 'ORD006';
+
+-- View stream (captures the update as DELETE + INSERT)
+SELECT * FROM DEMO_INGEST_DB.RAW.ORDERS_STREAM;
+```
+
+---
+
+## Part 5: Hands-On Exercises
+
+### Exercise 1: Calculate Your Snowpipe Savings
+
+```sql
+-- Analyze your COPY INTO workloads and estimate Snowpipe savings
+WITH my_copy_analysis AS (
+    SELECT 
+        WAREHOUSE_NAME,
+        COUNT(*) as COPY_COUNT,
+        SUM(TOTAL_ELAPSED_TIME) / 1000 / 3600 as WAREHOUSE_HOURS,
+        AVG(ROWS_PRODUCED) as AVG_ROWS
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+    WHERE QUERY_TYPE = 'COPY'
+      AND START_TIME >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+    GROUP BY WAREHOUSE_NAME
+)
+SELECT 
+    WAREHOUSE_NAME,
+    COPY_COUNT,
+    ROUND(WAREHOUSE_HOURS * 2, 2) as ESTIMATED_CURRENT_CREDITS,  -- Assume SMALL WH
+    ROUND(WAREHOUSE_HOURS * 0.3 * 1.25, 2) as ESTIMATED_SNOWPIPE_CREDITS,
+    ROUND(WAREHOUSE_HOURS * 2 - WAREHOUSE_HOURS * 0.3 * 1.25, 2) as POTENTIAL_SAVINGS,
+    CASE 
+        WHEN COPY_COUNT > 500 AND AVG_ROWS < 500000 THEN '🟢 High savings potential'
+        WHEN COPY_COUNT > 100 THEN '🟡 Moderate savings'
+        ELSE '⚪ Evaluate further'
+    END as RECOMMENDATION
+FROM my_copy_analysis
+ORDER BY POTENTIAL_SAVINGS DESC;
+```
+
+### Exercise 2: Design a Dynamic Table Pipeline
+
+```sql
+-- Design exercise: Create a simple DT pipeline for your data
+
+-- 1. Identify a source table in your environment
+-- SHOW TABLES IN DATABASE YOUR_DB;
+
+-- 2. Create Bronze layer (cleaned data)
+/*
+CREATE OR REPLACE DYNAMIC TABLE YOUR_DB.BRONZE.YOUR_TABLE_CLEANED
+    TARGET_LAG = '5 minutes'
+    WAREHOUSE = YOUR_WH
+AS
+SELECT 
+    <cleaned columns>
+FROM YOUR_DB.RAW.YOUR_TABLE;
+*/
+
+-- 3. Create Silver layer (enriched)
+/*
+CREATE OR REPLACE DYNAMIC TABLE YOUR_DB.SILVER.YOUR_TABLE_ENRICHED
+    TARGET_LAG = '15 minutes'
+    WAREHOUSE = YOUR_WH
+AS
+SELECT 
+    <joined/enriched columns>
+FROM YOUR_DB.BRONZE.YOUR_TABLE_CLEANED
+JOIN <reference tables>;
+*/
+
+-- 4. Create Gold layer (aggregated)
+/*
+CREATE OR REPLACE DYNAMIC TABLE YOUR_DB.GOLD.YOUR_SUMMARY
+    TARGET_LAG = '1 hour'
+    WAREHOUSE = YOUR_WH
+AS
+SELECT 
+    <aggregated metrics>
+FROM YOUR_DB.SILVER.YOUR_TABLE_ENRICHED
+GROUP BY <dimensions>;
+*/
+```
+
+### Exercise 3: Compare Task Costs
+
+```sql
+-- Compare your warehouse tasks vs potential serverless costs
+SELECT 
+    NAME,
+    WAREHOUSE,
+    AVG(SCHEDULED_TIME_DIFF) / 1000 as AVG_RUNTIME_SEC,
+    COUNT(*) * AVG(SCHEDULED_TIME_DIFF) / 1000 / 3600 as TOTAL_RUNTIME_HOURS,
+    -- Estimate current cost (warehouse-based)
+    COUNT(*) * AVG(SCHEDULED_TIME_DIFF) / 1000 / 3600 * 2 as CURRENT_CREDITS,  -- Assume SMALL WH
+    -- Estimate serverless cost (1.25x rate but no idle time)
+    COUNT(*) * AVG(SCHEDULED_TIME_DIFF) / 1000 / 3600 * 1.25 as SERVERLESS_CREDITS,
+    CASE 
+        WHEN AVG(SCHEDULED_TIME_DIFF) / 1000 < 60 THEN '🟢 Switch to serverless'
+        WHEN AVG(SCHEDULED_TIME_DIFF) / 1000 < 300 THEN '🟡 Consider serverless'
+        ELSE '⚪ Keep warehouse'
+    END as RECOMMENDATION
+FROM SNOWFLAKE.ACCOUNT_USAGE.TASK_HISTORY
+WHERE SCHEDULED_TIME >= DATEADD(day, -7, CURRENT_TIMESTAMP())
+  AND STATE = 'SUCCEEDED'
+GROUP BY NAME, WAREHOUSE
+ORDER BY CURRENT_CREDITS DESC;
+```
+
+---
+
+## Cleanup Demo Resources
+
+```sql
+-- Remove demo objects
+DROP DATABASE IF EXISTS DEMO_INGEST_DB;
+```
+
+---
+
+## Summary: Serverless Migration Decision Matrix
+
+| Current Pattern | Serverless Alternative | When to Migrate |
+|-----------------|----------------------|-----------------|
+| Frequent COPY INTO | Snowpipe | >10 loads/hour, small files |
+| Scheduled CTAS/INSERT | Dynamic Tables | Regular refresh needed |
+| Short-running tasks | Serverless Tasks | <5 min runtime |
+| Change tracking | Streams + Tasks | Incremental processing |
+
+### Expected Savings
+
+| Migration | Typical Savings |
+|-----------|----------------|
+| COPY INTO → Snowpipe | 40-70% |
+| Tasks → Dynamic Tables | 20-40% |
+| Traditional → Serverless Tasks | 10-30% |
+
+### Next Demo:
+Continue to **Demo 05: Monitoring Framework** for alerts and dashboards.
+
+---
+
+*Demo Version: 1.0*
+*Last Updated: January 2026*

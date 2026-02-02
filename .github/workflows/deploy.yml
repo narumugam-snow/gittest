@@ -1,0 +1,150 @@
+name: Deploy Serverless Objects
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'definitions/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      component:
+        description: 'Component to deploy (all for everything)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - snowpipe
+          - dynamic_tables
+          - tasks
+          - streams
+
+env:
+  SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+  SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+  SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+  SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+  SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+
+jobs:
+  deploy:
+    name: Deploy to Snowflake
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Snowflake CLI
+        run: |
+          pip install snowflake-cli-labs
+          snow --version
+
+      - name: Configure Snowflake connection
+        run: |
+          mkdir -p ~/.snowflake
+          cat > ~/.snowflake/connections.toml << EOF
+          [default]
+          account = "$SNOWFLAKE_ACCOUNT"
+          user = "$SNOWFLAKE_USER"
+          password = "$SNOWFLAKE_PASSWORD"
+          role = "$SNOWFLAKE_ROLE"
+          warehouse = "$SNOWFLAKE_WAREHOUSE"
+          database = "$SNOWFLAKE_DATABASE"
+          EOF
+
+      - name: Deploy base infrastructure
+        run: |
+          echo "🏗️ Deploying base infrastructure..."
+          snow sql -f "definitions/infrastructure.sql"
+
+      - name: Deploy Snowpipe
+        if: ${{ github.event.inputs.component == 'all' || github.event.inputs.component == 'snowpipe' || github.event_name == 'push' }}
+        run: |
+          if [ -f "definitions/snowpipe.sql" ]; then
+            echo "🔄 Deploying Snowpipe definitions..."
+            snow sql -f "definitions/snowpipe.sql"
+            echo "✅ Snowpipe deployed"
+          fi
+
+      - name: Deploy Dynamic Tables
+        if: ${{ github.event.inputs.component == 'all' || github.event.inputs.component == 'dynamic_tables' || github.event_name == 'push' }}
+        run: |
+          if [ -f "definitions/dynamic_tables.sql" ]; then
+            echo "📊 Deploying Dynamic Tables..."
+            snow sql -f "definitions/dynamic_tables.sql"
+            
+            echo "⏳ Triggering initial refresh..."
+            snow sql -q "ALTER DYNAMIC TABLE DEMO_INGEST_DB.BRONZE.ORDERS_CLEANED REFRESH;"
+            snow sql -q "ALTER DYNAMIC TABLE DEMO_INGEST_DB.BRONZE.CUSTOMERS_CLEANED REFRESH;"
+            echo "✅ Dynamic Tables deployed and refreshed"
+          fi
+
+      - name: Deploy Streams
+        if: ${{ github.event.inputs.component == 'all' || github.event.inputs.component == 'streams' || github.event_name == 'push' }}
+        run: |
+          if [ -f "definitions/streams.sql" ]; then
+            echo "🌊 Deploying Streams..."
+            snow sql -f "definitions/streams.sql"
+            echo "✅ Streams deployed"
+          fi
+
+      - name: Deploy Tasks
+        if: ${{ github.event.inputs.component == 'all' || github.event.inputs.component == 'tasks' || github.event_name == 'push' }}
+        run: |
+          if [ -f "definitions/tasks.sql" ]; then
+            echo "⏰ Deploying Tasks..."
+            snow sql -f "definitions/tasks.sql"
+            
+            echo "▶️ Resuming tasks..."
+            snow sql -q "ALTER TASK DEMO_INGEST_DB.RAW.PROCESS_ORDERS_STREAM RESUME;"
+            snow sql -q "ALTER TASK DEMO_INGEST_DB.RAW.CLEANUP_OLD_DATA_SERVERLESS RESUME;"
+            echo "✅ Tasks deployed and started"
+          fi
+
+      - name: Verify deployment
+        run: |
+          echo "🔍 Verifying deployment..."
+          
+          echo "📋 Dynamic Tables:"
+          snow sql -q "SHOW DYNAMIC TABLES IN DATABASE DEMO_INGEST_DB;"
+          
+          echo "📋 Pipes:"
+          snow sql -q "SHOW PIPES IN DATABASE DEMO_INGEST_DB;"
+          
+          echo "📋 Streams:"
+          snow sql -q "SHOW STREAMS IN DATABASE DEMO_INGEST_DB;"
+          
+          echo "📋 Tasks:"
+          snow sql -q "SHOW TASKS IN DATABASE DEMO_INGEST_DB;"
+
+      - name: Post deployment summary
+        if: always()
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment || 'dev' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Component:** ${{ github.event.inputs.component || 'all' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Object Type | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Infrastructure | ✅ Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Snowpipe | ✅ Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dynamic Tables | ✅ Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Streams | ✅ Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tasks | ✅ Deployed |" >> $GITHUB_STEP_SUMMARY

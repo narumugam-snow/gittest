@@ -1,0 +1,47 @@
+-- Snowpipe for continuous data loading
+-- Auto-ingest from cloud storage
+
+CREATE OR REPLACE PIPE DEMO_INGEST_DB.RAW.CUSTOMER_EVENTS_PIPE
+    AUTO_INGEST = TRUE
+    COMMENT = 'Continuous ingestion for customer events'
+AS
+COPY INTO DEMO_INGEST_DB.RAW.CUSTOMER_EVENTS (
+    EVENT_ID,
+    CUSTOMER_ID,
+    EVENT_TYPE,
+    EVENT_TIMESTAMP,
+    EVENT_DATA,
+    FILE_NAME
+)
+FROM (
+    SELECT 
+        $1::VARCHAR as EVENT_ID,
+        $2::VARCHAR as CUSTOMER_ID,
+        $3::VARCHAR as EVENT_TYPE,
+        TRY_TO_TIMESTAMP($4) as EVENT_TIMESTAMP,
+        TRY_PARSE_JSON($5) as EVENT_DATA,
+        METADATA$FILENAME as FILE_NAME
+    FROM @DEMO_INGEST_DB.RAW.INTERNAL_STAGE
+);
+
+-- Orders pipe for batch files
+CREATE OR REPLACE PIPE DEMO_INGEST_DB.RAW.ORDERS_PIPE
+    AUTO_INGEST = TRUE
+    COMMENT = 'Continuous ingestion for orders data'
+AS
+COPY INTO DEMO_INGEST_DB.RAW.ORDERS_RAW (
+    ORDER_ID,
+    CUSTOMER_ID,
+    ORDER_DATE,
+    ORDER_AMOUNT,
+    STATUS
+)
+FROM (
+    SELECT 
+        $1::VARCHAR as ORDER_ID,
+        $2::VARCHAR as CUSTOMER_ID,
+        $3::VARCHAR as ORDER_DATE,
+        $4::VARCHAR as ORDER_AMOUNT,
+        $5::VARCHAR as STATUS
+    FROM @DEMO_INGEST_DB.RAW.INTERNAL_STAGE/orders/
+);

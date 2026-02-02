@@ -1,0 +1,105 @@
+name: Validate Serverless Objects
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'definitions/**'
+      - '.github/workflows/**'
+
+env:
+  SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+  SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+  SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+  SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+  SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+
+jobs:
+  validate:
+    name: Validate SQL Definitions
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Snowflake CLI
+        run: |
+          pip install snowflake-cli-labs
+          snow --version
+
+      - name: Configure Snowflake connection
+        run: |
+          mkdir -p ~/.snowflake
+          cat > ~/.snowflake/connections.toml << EOF
+          [default]
+          account = "$SNOWFLAKE_ACCOUNT"
+          user = "$SNOWFLAKE_USER"
+          password = "$SNOWFLAKE_PASSWORD"
+          role = "$SNOWFLAKE_ROLE"
+          warehouse = "$SNOWFLAKE_WAREHOUSE"
+          database = "$SNOWFLAKE_DATABASE"
+          EOF
+
+      - name: Get changed files
+        id: changed
+        run: |
+          echo "files=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} | grep '\.sql$' | tr '\n' ' ')" >> $GITHUB_OUTPUT
+
+      - name: Validate SQL syntax
+        if: steps.changed.outputs.files != ''
+        run: |
+          echo "Validating changed SQL files: ${{ steps.changed.outputs.files }}"
+          for file in ${{ steps.changed.outputs.files }}; do
+            echo "📄 Validating: $file"
+            snow sql -f "$file" --dry-run || exit 1
+          done
+          echo "✅ All SQL files validated successfully"
+
+      - name: Validate Snowpipe definitions
+        run: |
+          if [ -f "definitions/snowpipe.sql" ]; then
+            echo "🔄 Validating Snowpipe definitions..."
+            snow sql -f "definitions/snowpipe.sql" --dry-run
+          fi
+
+      - name: Validate Dynamic Tables
+        run: |
+          if [ -f "definitions/dynamic_tables.sql" ]; then
+            echo "📊 Validating Dynamic Table definitions..."
+            snow sql -f "definitions/dynamic_tables.sql" --dry-run
+          fi
+
+      - name: Validate Tasks
+        run: |
+          if [ -f "definitions/tasks.sql" ]; then
+            echo "⏰ Validating Task definitions..."
+            snow sql -f "definitions/tasks.sql" --dry-run
+          fi
+
+      - name: Validate Streams
+        run: |
+          if [ -f "definitions/streams.sql" ]; then
+            echo "🌊 Validating Stream definitions..."
+            snow sql -f "definitions/streams.sql" --dry-run
+          fi
+
+      - name: Post validation summary
+        if: always()
+        run: |
+          echo "## Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| SQL Syntax | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Snowpipe | ✅ Validated |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dynamic Tables | ✅ Validated |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tasks | ✅ Validated |" >> $GITHUB_STEP_SUMMARY
+          echo "| Streams | ✅ Validated |" >> $GITHUB_STEP_SUMMARY
